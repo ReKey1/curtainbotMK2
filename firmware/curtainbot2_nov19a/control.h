@@ -1,6 +1,8 @@
 // ESP32 Automatic Curtain Controller - Object Oriented
 // L298N Motor Driver + Quadrature Encoders
 // Two independent motors with stall detection
+#pragma once
+#include "config.h"
 
 // ========== PIN DEFINITIONS ==========
 const int M1_IN1_PIN = 16;
@@ -71,6 +73,26 @@ private:
   int openDirection;   // 1 or -1
   int closeDirection;  // 1 or -1
 
+  // Position calibration (learned from full travels, persisted via calibration.h)
+  long travelSpanTicks;  // encoder ticks across full travel; 0 = not yet measured
+  int  openSign;         // sign of encoder delta while opening; 0 = unknown
+  bool anchorValid;      // closedAnchor can be trusted
+  long closedAnchor;     // encoder count at the fully-closed position
+  bool calibDirtyFlag;   // calibration changed since last save
+
+  // Per-move bookkeeping (for span measurement and go-to targets)
+  long  moveStartCount;
+  State moveStartState;  // state when the current/last move began
+  bool  hasTarget;       // moving toward targetTicks instead of an endpoint
+  long  targetTicks;     // go-to target, in ticks-from-closed
+
+  // Self-tuning stall baseline: highest ticks-per-check-interval seen during
+  // the current move (ratchets up only; reset at every move start)
+  long moveMaxRate;
+
+  // Direction of the last commanded movement (physical buttons alternate it)
+  bool lastCommandedOpen;
+
 public:
   Motor(int _in1, int _in2, int _en, int _encA, int _encB, int _pwmCh, volatile long* _encPtr)
     : in1Pin(_in1), in2Pin(_in2), enPin(_en), 
@@ -89,7 +111,18 @@ public:
       lastCheckCount(0),
       stallStartTime(0),
       openDirection(1),           // Positive encoder = open (CHANGE if needed)
-      closeDirection(-1)          // Negative encoder = close (CHANGE if needed)
+      closeDirection(-1),         // Negative encoder = close (CHANGE if needed)
+      travelSpanTicks(0),
+      openSign(0),
+      anchorValid(false),
+      closedAnchor(0),
+      calibDirtyFlag(false),
+      moveStartCount(0),
+      moveStartState(STOPPED),
+      hasTarget(false),
+      targetTicks(0),
+      moveMaxRate(0),
+      lastCommandedOpen(false)
   {}
   
   void begin() {
@@ -124,24 +157,55 @@ public:
   // ===== Movement Commands =====
   void moveOpen() {
     if (currentState == MOVING_OPEN) return; // Already moving open
+    beginMove(false);
     startMovement(openDirection);
     currentState = MOVING_OPEN;
+    lastCommandedOpen = true;
   }
-  
+
   void moveClosed() {
     if (currentState == MOVING_CLOSED) return;
+    beginMove(false);
     startMovement(closeDirection);
     currentState = MOVING_CLOSED;
+    lastCommandedOpen = false;
   }
-  
+
+  // Move to an absolute position, 0 = closed .. 100 = open.
+  // Requires calibration (one full close + full open); returns false if not
+  // calibrated. Stops (state STOPPED) when the target is reached.
+  bool moveToPercent(float pct) {
+    if (!isCalibrated()) return false;
+    pct = constrain(pct, 0.0f, 100.0f);
+    long target = (long)(pct / 100.0f * travelSpanTicks + 0.5f);
+    long delta = target - positionTicks();
+    if (labs(delta) <= GOTO_DEADBAND_TICKS) {
+      if (isMoving()) stop();
+      return true; // already there
+    }
+    beginMove(true);
+    targetTicks = target;
+    if (delta > 0) {
+      startMovement(openDirection);
+      currentState = MOVING_OPEN;
+      lastCommandedOpen = true;
+    } else {
+      startMovement(closeDirection);
+      currentState = MOVING_CLOSED;
+      lastCommandedOpen = false;
+    }
+    return true;
+  }
+
   void stop() {
     setMotorPWM(0);
     currentState = STOPPED;
     isRamping = false;
     stallStartTime = 0;
+    hasTarget = false;
     currentPosition = *encCountPtr; // Update position on manual stop
   }
-  
+
   // ===== Status Getters =====
   State getState() const { return currentState; }
   bool isMoving() const { return currentState == MOVING_OPEN || currentState == MOVING_CLOSED; }
@@ -149,13 +213,77 @@ public:
   bool isClosed() const { return currentState == CLOSED; }
   long getPosition() const { return currentPosition; }
   long getEncoderCount() const { return *encCountPtr; }
+  bool lastMovedOpen() const { return lastCommandedOpen; }
+
+  // ===== Position / Calibration =====
+  bool isCalibrated() const { return travelSpanTicks > 0 && openSign != 0 && anchorValid; }
+
+  // Live position in ticks from the closed endpoint (only meaningful when
+  // anchorValid && openSign != 0).
+  long positionTicks() const { return (*encCountPtr - closedAnchor) * (long)openSign; }
+
+  // Live position, 0 = closed .. 100 = open; -1 when not calibrated.
+  float positionPercent() const {
+    if (!isCalibrated()) return -1.0f;
+    float pct = 100.0f * (float)positionTicks() / (float)travelSpanTicks;
+    return constrain(pct, 0.0f, 100.0f);
+  }
+
+  long getTravelSpan() const { return travelSpanTicks; }
+  int getOpenSign() const { return openSign; }
+
+  // Restore persisted calibration at boot. savedState is the raw State value
+  // saved at the last endpoint stall, or -1 if unknown; the current encoder
+  // count is re-anchored to that endpoint.
+  void restoreCalibration(long span, int sign, int savedState) {
+    travelSpanTicks = span;
+    openSign = sign;
+    if (savedState == (int)OPEN || savedState == (int)CLOSED) {
+      currentState = (State)savedState;
+      lastCommandedOpen = (savedState == (int)OPEN);
+      long enc = *encCountPtr;
+      if (savedState == (int)CLOSED) {
+        closedAnchor = enc;
+        anchorValid = true;
+      } else if (sign != 0 && span > 0) {
+        closedAnchor = enc - sign * span;
+        anchorValid = true;
+      }
+    }
+  }
+
+  void clearCalibration() {
+    travelSpanTicks = 0;
+    openSign = 0;
+    anchorValid = false;
+    calibDirtyFlag = false;
+  }
+
+  bool consumeCalibDirty() {
+    bool d = calibDirtyFlag;
+    calibDirtyFlag = false;
+    return d;
+  }
   
   // ===== Main Update (call in loop) =====
   void update() {
     if (!isMoving()) return;
-    
+
     unsigned long now = millis();
-    
+
+    // Go-to target reached? (checked even during ramp — short moves may
+    // complete before the ramp does)
+    if (hasTarget && isCalibrated()) {
+      long pos = positionTicks();
+      bool reached = (currentState == MOVING_OPEN) ? (pos >= targetTicks)
+                                                   : (pos <= targetTicks);
+      if (reached) {
+        stop();
+        Serial.println("Position target reached");
+        return;
+      }
+    }
+
     // Handle ramping
     if (isRamping) {
       unsigned long elapsed = now - rampStartTime;
@@ -173,45 +301,114 @@ public:
       setMotorPWM(currentPWM * ((currentState == MOVING_OPEN) ? openDirection : closeDirection));
       return; // No stall detection during ramp
     }
-    
+
     // Stall detection (only after ramp)
     if (now - lastCheckTime >= checkIntervalMs) {
       long currentCount = *encCountPtr;
       long delta = abs(currentCount - lastCheckCount);
-      
-      if (delta < minTicksPerInterval) {
+
+      // Ratchet up this move's healthy cruise rate. It only rises, so a belt
+      // slipping at the limit (slow but nonzero ticks) can't drag the stall
+      // threshold down with it.
+      if (delta > moveMaxRate) moveMaxRate = delta;
+
+      // Stall threshold: a fraction of the cruise rate, never below the fixed
+      // floor (which also covers moves that start already stalled).
+      float threshold = fmaxf((float)minTicksPerInterval, STALL_RATIO * (float)moveMaxRate);
+
+      if ((float)delta < threshold) {
         // Low movement detected
         if (stallStartTime == 0) {
           stallStartTime = now;
         } else if (now - stallStartTime >= stallTimeoutMs) {
-          // Stall confirmed - set state based on direction
-          setMotorPWM(0);
-          if (currentState == MOVING_OPEN) {
-            currentState = OPEN;
-            Serial.println("OPEN limit reached");
-          } else if (currentState == MOVING_CLOSED) {
-            currentState = CLOSED;
-            Serial.println("CLOSED limit reached");
-          }
-          currentPosition = *encCountPtr; // Update position
+          handleStall();
           return;
         }
       } else {
         // Movement detected, reset stall timer
         stallStartTime = 0;
       }
-      
+
       lastCheckCount = currentCount;
       lastCheckTime = now;
     }
   }
-  
+
 private:
+  void beginMove(bool targeted) {
+    moveStartState = currentState;
+    moveStartCount = *encCountPtr;
+    hasTarget = targeted;
+  }
+
+  // Stall confirmed: decide endpoint vs obstruction, learn calibration,
+  // re-anchor position tracking.
+  void handleStall() {
+    setMotorPWM(0);
+    bool opening = (currentState == MOVING_OPEN);
+    long enc = *encCountPtr;
+
+    // With a trusted position, a stall far from the expected end of travel is
+    // an obstruction, not the limit — stop without touching the calibration.
+    if (isCalibrated()) {
+      float pct = positionPercent();
+      float expected = opening ? 100.0f : 0.0f;
+      if (fabsf(pct - expected) > ENDPOINT_TOLERANCE_PCT) {
+        currentState = STOPPED;
+        hasTarget = false;
+        currentPosition = enc;
+        Serial.println("Stall mid-travel (obstruction?) - stopped");
+        return;
+      }
+    }
+
+    // Endpoint reached. Learn which way the encoder counts when opening.
+    if (openSign == 0 && enc != moveStartCount) {
+      int travelSign = (enc > moveStartCount) ? 1 : -1;
+      openSign = opening ? travelSign : -travelSign;
+      calibDirtyFlag = true;
+    }
+
+    // A full endpoint-to-endpoint travel measures the span. Ignore
+    // suspiciously short measurements (likely an obstructed run).
+    if (!hasTarget && openSign != 0 && moveStartState == (opening ? CLOSED : OPEN)) {
+      long measured = labs(enc - moveStartCount);
+      if (measured > 0 && (travelSpanTicks == 0 || measured > travelSpanTicks / 2)) {
+        travelSpanTicks = (travelSpanTicks == 0)
+          ? measured
+          : (travelSpanTicks + measured) / 2;  // smooth over belt-tension noise
+        calibDirtyFlag = true;
+        Serial.print("Travel span calibrated: ");
+        Serial.print(travelSpanTicks);
+        Serial.println(" ticks");
+      }
+    }
+
+    // Re-anchor position tracking at this endpoint (kills accumulated drift).
+    if (opening) {
+      currentState = OPEN;
+      if (openSign != 0 && travelSpanTicks > 0) {
+        closedAnchor = enc - openSign * travelSpanTicks;
+        anchorValid = true;
+      }
+      Serial.println("OPEN limit reached");
+    } else {
+      currentState = CLOSED;
+      closedAnchor = enc;
+      anchorValid = true;
+      Serial.println("CLOSED limit reached");
+    }
+    hasTarget = false;
+    currentPosition = enc;
+    calibDirtyFlag = true;  // persist the endpoint state
+  }
+
   void startMovement(int direction) {
     isRamping = true;
     rampStartTime = millis();
     currentPWM = 0;
     stallStartTime = 0;
+    moveMaxRate = 0;  // re-learn the cruise rate for this move
     lastCheckTime = millis();
     lastCheckCount = *encCountPtr;
     
@@ -259,6 +456,11 @@ void IRAM_ATTR isrEnc2() {
 Motor motor1(M1_IN1_PIN, M1_IN2_PIN, M1_EN_PIN, M1_ENC_A, M1_ENC_B, 0, &encCount1);
 Motor motor2(M2_IN1_PIN, M2_IN2_PIN, M2_EN_PIN, M2_ENC_A, M2_ENC_B, 1, &encCount2);
 
+// Physical placement: motor1 drives the RIGHT curtain, motor2 the LEFT.
+// Everything user-facing (web commands, routines) uses these aliases.
+Motor& motorRight = motor1;
+Motor& motorLeft  = motor2;
+
 // ========== SETUP ==========
 void controlSetup() {
   Serial.begin(115200);
@@ -279,26 +481,30 @@ void controlSetup() {
   motor1.begin();
   motor2.begin();
   
-  // Motor 1 direction reversal (from your config)
-  motor1.reverseOpenDirection();
-  motor1.reverseCloseDirection();
-  motor2.reverseOpenDirection();
-  motor2.reverseCloseDirection();  
+  // Direction mapping (flags in config.h; flip there if a motor runs backwards)
+  if (MOTOR1_REVERSED) {
+    motor1.reverseOpenDirection();
+    motor1.reverseCloseDirection();
+  }
+  if (MOTOR2_REVERSED) {
+    motor2.reverseOpenDirection();
+    motor2.reverseCloseDirection();
+  }
   
-  // Configure motor parameters
-  motor1.setSpeed(180);
-  motor2.setSpeed(180);
-  motor1.setRampTime(1000);
-  motor2.setRampTime(1000);
-  
-  // Stall detection settings
-  motor1.setStallCheckInterval(30);
-  motor1.setMinTicksPerInterval(15);
-  motor1.setStallTimeout(5);
-  
-  motor2.setStallCheckInterval(30);
-  motor2.setMinTicksPerInterval(15);
-  motor2.setStallTimeout(5);
+  // Configure motor parameters (tunables live in config.h)
+  motor1.setSpeed(MOTOR_SPEED);
+  motor2.setSpeed(MOTOR_SPEED);
+  motor1.setRampTime(MOTOR_RAMP_MS);
+  motor2.setRampTime(MOTOR_RAMP_MS);
+
+  // Stall detection settings (tunables live in config.h)
+  motor1.setStallCheckInterval(STALL_CHECK_MS);
+  motor1.setMinTicksPerInterval(STALL_MIN_TICKS);
+  motor1.setStallTimeout(STALL_TIMEOUT_MS);
+
+  motor2.setStallCheckInterval(STALL_CHECK_MS);
+  motor2.setMinTicksPerInterval(STALL_MIN_TICKS);
+  motor2.setStallTimeout(STALL_TIMEOUT_MS);
   
   // Attach encoder interrupts
   attachInterrupt(digitalPinToInterrupt(M1_ENC_A), isrEnc1, RISING);
@@ -349,20 +555,20 @@ void controlLoop() {
         btn1PressDetected = true;
       }
       
-      // Detect button release (HIGH) - trigger action if press was detected
+      // Detect button release (HIGH) - trigger action if press was detected.
+      // Stop if moving; otherwise go the opposite way of the last movement,
+      // so every press alternates direction.
       if (btn1LastStableState == HIGH && btn1PressDetected) {
         btn1PressDetected = false;
         if (motor1.isMoving()) {
           motor1.stop();
           Serial.println("Motor 1: Stopped by button");
+        } else if (motor1.lastMovedOpen()) {
+          motor1.moveClosed();
+          Serial.println("Motor 1: Closing");
         } else {
-          if (motor1.isClosed() || motor1.getState() == Motor::STOPPED) {
-            motor1.moveOpen();
-            Serial.println("Motor 1: Opening");
-          } else {
-            motor1.moveClosed();
-            Serial.println("Motor 1: Closing");
-          }
+          motor1.moveOpen();
+          Serial.println("Motor 1: Opening");
         }
       }
     }
@@ -387,14 +593,12 @@ void controlLoop() {
         if (motor2.isMoving()) {
           motor2.stop();
           Serial.println("Motor 2: Stopped by button");
+        } else if (motor2.lastMovedOpen()) {
+          motor2.moveClosed();
+          Serial.println("Motor 2: Closing");
         } else {
-          if (motor2.isClosed() || motor2.getState() == Motor::STOPPED) {
-            motor2.moveOpen();
-            Serial.println("Motor 2: Opening");
-          } else {
-            motor2.moveClosed();
-            Serial.println("Motor 2: Closing");
-          }
+          motor2.moveOpen();
+          Serial.println("Motor 2: Opening");
         }
       }
     }
